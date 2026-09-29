@@ -8,7 +8,7 @@
 //
 // Installer-only flags (--manifest, --no-serve, --with-*, ...) always go to
 // install.sh, even on an installed machine. Published as `moch-backend` on
-// npm because the `moch` package name is taken; the command is `moch`.
+// as `softland-moch` (plain `moch` was taken on npm); the command is `moch`.
 'use strict'
 
 const { spawnSync } = require('node:child_process')

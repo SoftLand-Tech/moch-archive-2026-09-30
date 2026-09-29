@@ -12,10 +12,10 @@ One command, then scan the QR it prints. Pick whichever route you have tools for
 
 ```bash
 # npm
-npm install -g moch-backend && moch-backend
+npm install -g softland-moch && moch
 
 # bun (same package, bun's global install)
-bun install -g moch-backend && moch-backend
+bun install -g softland-moch && moch
 
 # plain shell — nothing but curl and git needed
 curl -fsSL https://raw.githubusercontent.com/SoftLand-Tech/moch/main/scripts/install.sh | bash
@@ -24,8 +24,9 @@ curl -fsSL https://raw.githubusercontent.com/SoftLand-Tech/moch/main/scripts/ins
 Everything is then the `moch` command — `moch` (verify + reprint QR), `moch qr`,
 `moch status`, `moch restart`, `moch auth login`, `moch cron list`, and any
 other hermes command passes straight through. (The npm package is named
-`moch-backend` only because `moch` was already taken on the npm registry —
-the command you type is `moch` either way.)
+`softland-moch` because plain `moch` was already taken on the npm registry —
+the command you type is `moch` either way. An early publish lived briefly at
+`moch-backend` and is deprecated.)
 
 That single command:
 
