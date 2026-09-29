@@ -21,6 +21,12 @@ bun install -g moch-backend && moch-backend
 curl -fsSL https://raw.githubusercontent.com/SoftLand-Tech/moch/main/scripts/install.sh | bash
 ```
 
+Everything is then the `moch` command — `moch` (verify + reprint QR), `moch qr`,
+`moch status`, `moch restart`, `moch auth login`, `moch cron list`, and any
+other hermes command passes straight through. (The npm package is named
+`moch-backend` only because `moch` was already taken on the npm registry —
+the command you type is `moch` either way.)
+
 That single command:
 
 1. clones this repo to `~/.moch/moch-backend` and installs the locked

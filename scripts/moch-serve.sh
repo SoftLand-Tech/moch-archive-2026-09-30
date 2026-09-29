@@ -106,13 +106,21 @@ EOF
 token_value() { sed -n 's/^HERMES_DASHBOARD_SESSION_TOKEN=//p' "$ENV_FILE" | head -1; }
 
 install_moch_command() {
+    # npm/bun installs already put a `moch` shim on PATH (the package's bin);
+    # writing ours too would leave two `moch` commands shadowing each other.
+    if command -v "$MOCH_COMMAND" >/dev/null 2>&1; then
+        log_info "\`$MOCH_COMMAND\` already on PATH ($(command -v "$MOCH_COMMAND")) — leaving it alone"
+        return 0
+    fi
     mkdir -p "$BIN_DIR"
+    # Same routing as the npm shim: control subcommands → moch-serve.sh,
+    # anything else → the backend's own CLI (moch auth login, moch cron …).
     cat > "$BIN_DIR/$MOCH_COMMAND" <<EOF
 #!/usr/bin/env bash
-unset PYTHONPATH
-unset PYTHONHOME
-export HERMES_HOME="$MOCH_HOME"
-exec "$MOCH_CMD" "\$@"
+case "\$1" in
+  ""|setup|status|restart|stop|qr|uninstall) exec "$INSTALL_DIR/scripts/moch-serve.sh" "\$@" ;;
+  *) export HERMES_HOME="$MOCH_HOME"; exec "$MOCH_CMD" "\$@" ;;
+esac
 EOF
     chmod +x "$BIN_DIR/$MOCH_COMMAND"
     log_success "Installed \`$MOCH_COMMAND\` command → $BIN_DIR/$MOCH_COMMAND"

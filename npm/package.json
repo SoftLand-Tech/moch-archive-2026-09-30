@@ -1,11 +1,12 @@
 {
   "name": "moch-backend",
-  "version": "0.1.0",
-  "description": "One command to install the Moch backend — your AI agent at home, in your pocket. Mobile backend fork of hermes-agent (MIT, Nous Research).",
+  "version": "0.1.1",
+  "description": "moch \u2014 one command to install and control the Moch backend: your AI agent at home, in your pocket. Mobile backend fork of hermes-agent (MIT, Nous Research). (npm name: the plain `moch` package is taken.)",
   "license": "MIT",
   "author": "Mamoun Hisham <mamounprogrammer@gmail.com>",
   "bin": {
-    "moch-backend": "bin/moch-backend.js"
+    "moch": "bin/moch.js",
+    "moch-backend": "bin/moch.js"
   },
   "files": [
     "bin/",
