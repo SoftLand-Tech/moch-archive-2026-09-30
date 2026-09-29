@@ -20,19 +20,24 @@ set -u
 # hygiene can't break the locked sync the way it used to before pm owned it.
 export UV_NO_CONFIG=1
 
-REPO_URL="${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
+# Moch: installs the mobile-app backend fork of hermes-agent. Upstream URL
+# stays available via HERMES_REPO_URL for syncing worktrees.
+REPO_URL="${HERMES_REPO_URL:-https://github.com/SoftLand-Tech/moch.git}"
 BRANCH="main"
 INSTALL_COMMIT=""
 INSTALL_DIR="${HERMES_INSTALL_DIR:-}"
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_HOME="${HERMES_HOME:-$HOME/.moch}"
 STAGE=""
 WANT_MANIFEST=false
 JSON=false
-NON_INTERACTIVE=false
+# Moch defaults: one command, no prompts — the mobile backend never needs the
+# interactive wizard, browser tooling or computer-use. Opt back in explicitly.
+NON_INTERACTIVE=true
 INCLUDE_DESKTOP=false
 VERBOSE=false
-SKIP_BROWSER=false
-SKIP_COMPUTER_USE=false
+SKIP_BROWSER=true
+SKIP_COMPUTER_USE=true
+MOCH_SKIP_SERVE=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -54,16 +59,25 @@ while [ $# -gt 0 ]; do
         --json|-Json) JSON=true; shift ;;
         --non-interactive|-NonInteractive) NON_INTERACTIVE=true; shift ;;
         --skip-setup) NON_INTERACTIVE=true; shift ;;
+        --interactive) NON_INTERACTIVE=false; shift ;;
         --skip-browser|--no-playwright|-SkipBrowser) SKIP_BROWSER=true; shift ;;
         --skip-computer-use|-SkipComputerUse) SKIP_COMPUTER_USE=true; shift ;;
+        --with-browser) SKIP_BROWSER=false; shift ;;
+        --with-computer-use) SKIP_COMPUTER_USE=false; shift ;;
+        --no-serve) MOCH_SKIP_SERVE=true; shift ;;
         --include-desktop|-IncludeDesktop) INCLUDE_DESKTOP=true; shift ;;
         --verbose|-Verbose) VERBOSE=true; shift ;;
         -h|--help)
             echo "Usage: install.sh [--branch NAME] [--commit SHA] [--dir PATH]"
             echo "                  [--hermes-home PATH]"
             echo "                  [--manifest] [--stage NAME] [--json]"
-            echo "                  [--non-interactive] [--include-desktop] [--verbose]"
-            echo "                  [--skip-browser] [--skip-computer-use]"
+            echo "                  [--interactive] [--include-desktop] [--verbose]"
+            echo "                  [--with-browser] [--with-computer-use] [--no-serve]"
+            echo
+            echo "  Moch install: non-interactive, no browser/computer-use tools, and"
+            echo "  the phone backend (moch-serve + cron timer + pairing QR) starts"
+            echo "  at the end. --no-serve skips that; --interactive runs the hermes"
+            echo "  wizard; --with-browser/--with-computer-use install those tools."
             echo
             echo "  --skip-browser  Do not install the browser tools (agent-browser + Chromium)."
             echo "                  Alias: --no-playwright. Remembered by later"
@@ -76,7 +90,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-INSTALL_DIR="${INSTALL_DIR:-$HERMES_HOME/hermes-agent}"
+INSTALL_DIR="${INSTALL_DIR:-$HERMES_HOME/moch-backend}"
 export HERMES_HOME
 
 INSTALL_LOG="$HERMES_HOME/logs/install.log"
@@ -100,9 +114,9 @@ fail() { STAGE_REASON="$1"; log_error "$1"; exit 1; }
 print_banner() {
     printf '\n%s%s' "$C_MAGENTA" "$C_BOLD"
     printf '%s\n' "┌─────────────────────────────────────────────────────────┐"
-    printf '%s\n' "│             ☤ Hermes Agent Installer                    │"
+    printf '%s\n' "│                 ◠◠ Moch Backend Installer                │"
     printf '%s\n' "├─────────────────────────────────────────────────────────┤"
-    printf '%s\n' "│  An open source AI agent by Nous Research.              │"
+    printf '%s\n' "│  Your AI agent at home, in your pocket.                  │"
     printf '%s\n' "└─────────────────────────────────────────────────────────┘"
     printf '%s\n' "$C_NC"
 }
@@ -752,6 +766,15 @@ stage_config() {
     if [ ! -f "$HERMES_HOME/config.yaml" ] && [ -f "$INSTALL_DIR/cli-config.yaml.example" ]; then
         cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
     fi
+    # Moch: never expose the hermes command on PATH — a coexisting hermes
+    # install must stay untouched; this install ships only the `moch` wrapper.
+    if [ -f "$HERMES_HOME/config.yaml" ]; then
+        if ! grep -q '^cli:' "$HERMES_HOME/config.yaml"; then
+            printf '\ncli:\n  expose_on_path: false\n' >> "$HERMES_HOME/config.yaml"
+        elif ! grep -q 'expose_on_path' "$HERMES_HOME/config.yaml"; then
+            sed -i '/^cli:/a\  expose_on_path: false' "$HERMES_HOME/config.yaml"
+        fi
+    fi
     log_success "config prepared in $HERMES_HOME"
 }
 
@@ -788,7 +811,7 @@ stage_complete() {
             "$commit" "$BRANCH" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$INSTALL_DIR/.hermes-bootstrap-complete.tmp"
         mv -f "$INSTALL_DIR/.hermes-bootstrap-complete.tmp" "$INSTALL_DIR/.hermes-bootstrap-complete"
     fi
-    log_success "Hermes Agent install complete. Run: hermes"
+    log_success "Moch backend install complete. Pair the app with the QR above, or: moch qr"
 }
 
 print_path_reload_hint() {
@@ -865,4 +888,13 @@ if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
         [ "$rc" -eq 0 ] || exit "$rc"
     done
     print_path_reload_hint
+    # Moch: the install is only useful once the phone backend runs. Token,
+    # systemd units, cron timer and the pairing QR are one idempotent step.
+    if [ "$MOCH_SKIP_SERVE" = true ]; then
+        log "backend service setup skipped (--no-serve); run later:"
+        log "  $INSTALL_DIR/scripts/moch-serve.sh setup"
+    else
+        bash "$INSTALL_DIR/scripts/moch-serve.sh" setup \
+            || log_warn "backend service setup incomplete — re-run: $INSTALL_DIR/scripts/moch-serve.sh setup"
+    fi
 fi
