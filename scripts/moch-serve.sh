@@ -332,8 +332,9 @@ cmd_uninstall() {
     rm -f "$BIN_DIR/$MOCH_COMMAND"
     log_success "Removed services and the \`$MOCH_COMMAND\` command."
     if [ "${1:-}" = "--purge" ]; then
-        log_warn "Deleting $MOCH_HOME (all sessions, config, history!)"
+        log_warn "Deleting $MOCH_HOME and $ENV_FILE (all sessions, config, history!)"
         rm -rf "$MOCH_HOME"
+        rm -f "$ENV_FILE"
     else
         log_info "Data kept at $MOCH_HOME — re-run setup anytime, or pass --purge to delete."
     fi
