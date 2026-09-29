@@ -79,7 +79,7 @@ scripts/moch-serve.sh uninstall [--purge]
 
 Syncing is automatic: a scheduled GitHub Action (`.github/workflows/sync-upstream.yml`)
 merges [hermes-agent](https://github.com/NousResearch/hermes-agent) `main` into
-this repo **daily** (and on demand: Actions tab → *Sync upstream* → *Run
+this repo **hourly** (and on demand: Actions tab → *Sync upstream* → *Run
 workflow*). The Moch README always wins its conflicts; any other conflict
 fails the run and leaves `main` untouched until resolved by hand. The fork
 intentionally carries a **tiny diff** (installer specialization +
