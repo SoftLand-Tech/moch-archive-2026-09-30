@@ -6,11 +6,18 @@ Research) that runs one thing well: the WebSocket gateway your phone pairs
 with. No chat-platform integrations, no interactive CLI wizard, no browser or
 computer-use tooling — the phone is the only client.
 
-## One command
+## Install
 
-On any Linux box (or mac) that will host your agent:
+One command, then scan the QR it prints. Pick whichever route you have tools for:
 
 ```bash
+# npm
+npm install -g moch-backend && moch-backend
+
+# bun (same package, bun's global install)
+bun install -g moch-backend && moch-backend
+
+# plain shell — nothing but curl and git needed
 curl -fsSL https://raw.githubusercontent.com/SoftLand-Tech/moch/main/scripts/install.sh | bash
 ```
 

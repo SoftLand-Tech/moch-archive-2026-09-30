@@ -1,0 +1,40 @@
+{
+  "name": "moch-backend",
+  "version": "0.1.0",
+  "description": "One command to install the Moch backend — your AI agent at home, in your pocket. Mobile backend fork of hermes-agent (MIT, Nous Research).",
+  "license": "MIT",
+  "author": "Mamoun Hisham <mamounprogrammer@gmail.com>",
+  "bin": {
+    "moch-backend": "bin/moch-backend.js"
+  },
+  "files": [
+    "bin/",
+    "install.sh"
+  ],
+  "scripts": {
+    "prepack": "cp ../scripts/install.sh install.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SoftLand-Tech/moch.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/SoftLand-Tech/moch#readme",
+  "bugs": "https://github.com/SoftLand-Tech/moch/issues",
+  "keywords": [
+    "ai",
+    "agent",
+    "assistant",
+    "self-hosted",
+    "mobile",
+    "websocket",
+    "hermes"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ]
+}
