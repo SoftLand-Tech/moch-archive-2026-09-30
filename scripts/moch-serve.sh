@@ -118,7 +118,7 @@ install_moch_command() {
     cat > "$BIN_DIR/$MOCH_COMMAND" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
-  ""|setup|status|restart|stop|qr|uninstall) exec "$INSTALL_DIR/scripts/moch-serve.sh" "\$@" ;;
+  ""|setup|status|restart|stop|qr|import-hermes|uninstall) exec "$INSTALL_DIR/scripts/moch-serve.sh" "\$@" ;;
   *) export HERMES_HOME="$MOCH_HOME"; exec "$MOCH_CMD" "\$@" ;;
 esac
 EOF
@@ -225,8 +225,7 @@ start_services() {
 print_qr() {
     local host token py
     host="$(lan_ip)"
-    token="$(token_value)"
-    echo
+    token="$(token_value)"    echo
     echo -e "${BOLD}═══════════════════════ Moch is ready ═══════════════════════${NC}"
     echo
     # Vendored dependency-free generator (scripts/vendor/qrcodegen.py, MIT,
@@ -267,6 +266,29 @@ PY
     echo -e "${BOLD}═════════════════════════════════════════════════════════════${NC}"
 }
 
+# First run on a machine that already has Hermes: offer to bring its data over.
+maybe_offer_hermes_import() {
+    [ -d "$HOME/.hermes" ] || return 0
+    [ -f "$MOCH_HOME/auth.json" ] && return 0   # already imported / own auth
+    echo
+    log_info "Found an existing Hermes install at ~/.hermes."
+    if [ -t 0 ] && (: </dev/tty) 2>/dev/null; then
+        local answer
+        printf "%s Import its providers, skills, memories, cron jobs and sessions? [Y/n] " "$(printf '%s[moch]%s' "$CYAN" "$NC")"
+        read -r answer </dev/tty || answer="y"
+        case "$answer" in
+            n*|N*)
+                log_info "Skipped. Import later anytime with:  moch import-hermes"
+                return 0 ;;
+            *)
+                bash "$SCRIPT_DIR/moch-import-hermes.sh" || true ;;
+        esac
+    else
+        log_info "Import its data (providers/skills/memories/cron/sessions) with:"
+        log_info "  moch import-hermes"
+    fi
+}
+
 cmd_setup() {
     require_install
     ensure_token
@@ -278,6 +300,7 @@ cmd_setup() {
         log_warn "systemd --user unavailable — skipping service install."
         log_warn "Run the backend manually:  HERMES_HOME=$MOCH_HOME $MOCH_CMD serve --host 127.0.0.1 --port $MOCH_PORT"
     fi
+    maybe_offer_hermes_import
     print_qr
 }
 
@@ -322,6 +345,7 @@ case "${1:-setup}" in
     restart)   cmd_restart ;;
     stop)      cmd_stop ;;
     qr)        require_install; print_qr ;;
+    import-hermes) shift; exec bash "$SCRIPT_DIR/moch-import-hermes.sh" "$@" ;;
     uninstall) shift; cmd_uninstall "${1:-}" ;;
-    *) echo "Usage: moch-serve.sh {setup|status|restart|stop|qr|uninstall [--purge]}"; exit 1 ;;
+    *) echo "Usage: moch-serve.sh {setup|status|restart|stop|qr|import-hermes|uninstall [--purge]}"; exit 1 ;;
 esac

@@ -82,6 +82,22 @@ journalctl --user -u moch-serve.service -f
 scripts/moch-serve.sh uninstall [--purge]
 ```
 
+## Coming from Hermes?
+
+If the machine already runs a hermes install, Moch detects it during setup and
+offers to import its data — or do it anytime:
+
+```bash
+moch import-hermes              # providers, skills, memories, cron jobs, sessions, hooks
+moch import-hermes --dry-run    # preview first
+moch import-hermes --src ~/other-hermes-home
+```
+
+The import is read-only on the source and never overwrites files already in
+`~/.moch`, so it's safe to re-run. `config.yaml` is deliberately excluded:
+platform bindings (WhatsApp, Telegram, …) and gateway ports are exactly what
+Moch replaces — cherry-pick any model/tool tuning by hand.
+
 ## Staying close to upstream
 
 Syncing is automatic: a scheduled GitHub Action (`.github/workflows/sync-upstream.yml`)

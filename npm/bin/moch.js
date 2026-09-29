@@ -7,8 +7,8 @@
 //                            `moch` re-runs the idempotent setup, reprinting the QR)
 //
 // Installer-only flags (--manifest, --no-serve, --with-*, ...) always go to
-// install.sh, even on an installed machine. Published as `moch-backend` on
-// as `softland-moch` (plain `moch` was taken on npm); the command is `moch`.
+// install.sh, even on an installed machine. Published as `softland-moch`
+// (plain `moch` was taken on npm); the command is `moch`.
 'use strict'
 
 const { spawnSync } = require('node:child_process')
@@ -18,7 +18,7 @@ const os = require('node:os')
 
 const script = path.join(__dirname, '..', 'install.sh')
 const serveScript = path.join(os.homedir(), '.moch', 'moch-backend', 'scripts', 'moch-serve.sh')
-const CONTROL_SUBCOMMANDS = new Set(['setup', 'status', 'restart', 'stop', 'qr', 'uninstall'])
+const CONTROL_SUBCOMMANDS = new Set(['setup', 'status', 'restart', 'stop', 'qr', 'uninstall', 'import-hermes'])
 
 function usage() {
   console.log(`moch — install and control the Moch backend (mobile agent gateway)
@@ -28,6 +28,7 @@ Usage:
   moch qr                    pairing QR + token
   moch status                backend health
   moch restart | stop        service control
+  moch import-hermes         bring a ~/.hermes install's providers/skills/memories/cron/sessions over
   moch uninstall [--purge]   remove services and command (add --purge to delete ~/.moch data)
 
 Installer options (work before/after install):
