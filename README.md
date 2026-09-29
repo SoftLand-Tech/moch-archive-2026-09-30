@@ -77,8 +77,14 @@ scripts/moch-serve.sh uninstall [--purge]
 
 ## Staying close to upstream
 
-This fork intentionally carries a **tiny diff** (installer specialization +
-`moch-serve.sh`; zero Python changes so far), so syncing upstream is cheap:
+Syncing is automatic: a scheduled GitHub Action (`.github/workflows/sync-upstream.yml`)
+merges [hermes-agent](https://github.com/NousResearch/hermes-agent) `main` into
+this repo **daily** (and on demand: Actions tab → *Sync upstream* → *Run
+workflow*). The Moch README always wins its conflicts; any other conflict
+fails the run and leaves `main` untouched until resolved by hand. The fork
+intentionally carries a **tiny diff** (installer specialization +
+`moch-serve.sh`; zero Python changes so far), so those merges are usually
+silent. To sync locally instead:
 
 ```bash
 git remote add upstream https://github.com/NousResearch/hermes-agent.git

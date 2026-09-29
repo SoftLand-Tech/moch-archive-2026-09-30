@@ -1,0 +1,51 @@
+name: Sync upstream (hermes-agent)
+
+# Keeps this fork current with NousResearch/hermes-agent: daily merge of
+# upstream/main into main + push. README.md is deliberately OURS (the Moch
+# readme) — conflicts there resolve to our copy automatically. Any other
+# conflict fails the run and leaves main untouched for a manual merge.
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # daily 03:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out moch main (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          git config user.name "Mamoun Hisham"
+          git config user.email "162096711+MamounHisham1@users.noreply.github.com"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream main
+          if git merge --no-edit upstream/main; then
+            echo "synced=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          echo "Conflicted files: $conflicts"
+          remaining="$(printf '%s\n' "$conflicts" | grep -vx 'README.md' || true)"
+          if [ -n "$remaining" ]; then
+            echo "::error::Unhandled conflicts beyond README.md — merge upstream manually:"
+            printf '::error::%s\n' "$remaining"
+            exit 1
+          fi
+          git checkout --ours README.md
+          git add README.md
+          git -c core.editor=true merge --continue
+          echo "synced=yes" >> "$GITHUB_OUTPUT"
+
+      - name: Push
+        run: git push origin main
