@@ -1,6 +1,6 @@
 {
   "name": "softland-moch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "softland-moch \u2014 one command to install and control Moch, your AI agent at home, in your pocket. Mobile backend fork of hermes-agent (MIT, Nous Research). The command you type is `moch`.",
   "license": "MIT",
   "author": "Mamoun Hisham <mamounprogrammer@gmail.com>",
@@ -13,7 +13,8 @@
     "install.sh"
   ],
   "scripts": {
-    "prepack": "cp ../scripts/install.sh install.sh"
+    "prepack": "cp ../scripts/install.sh install.sh",
+    "postinstall": "node bin/moch.js || (printf '\\n[moch !] backend install did not finish \u2014 run \\`moch\\` to retry (nothing was lost).\\n'; exit 0)"
   },
   "repository": {
     "type": "git",

@@ -14,12 +14,17 @@ One command, then scan the QR it prints. Pick whichever route you have tools for
 # npm
 npm install -g softland-moch && moch
 
-# bun (same package, bun's global install)
+# bun (bun skips install scripts, so one follow-up command)
 bun install -g softland-moch && moch
 
 # plain shell — nothing but curl and git needed
 curl -fsSL https://raw.githubusercontent.com/SoftLand-Tech/moch/main/scripts/install.sh | bash
 ```
+
+Prefer a single command? Newer npm asks once whether to allow the
+package's install script — approve it and `npm install -g softland-moch`
+alone installs, starts the backend and prints the QR (the same hook runs on
+older npm with no question at all).
 
 Everything is then the `moch` command — `moch` (verify + reprint QR), `moch qr`,
 `moch status`, `moch restart`, `moch auth login`, `moch cron list`, and any
