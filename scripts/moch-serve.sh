@@ -4,21 +4,25 @@
 # ============================================================================
 # Turns a fresh `moch-backend` install into a running phone-ready backend:
 #   • generates a persistent pairing token   (~/.config/moch-serve.env)
-#   • installs systemd user units            (moch-serve.service + moch-cron.timer)
+#   • installs systemd user units:
+#       moch-serve.service  — `serve` on 127.0.0.1:<port> (token auth is
+#                             loopback-only in hermes >= 0.21.3)
+#       moch-proxy.service  — scripts/moch-proxy.js on 0.0.0.0:<proxy-port>,
+#                             rewriting Host so phones on LAN/Tailnet can pair
+#       moch-cron.timer     — one `cron tick` per minute (scheduled jobs
+#                             without the always-on messaging gateway)
 #   • installs the `moch` command            (~/.local/bin/moch)
 #   • starts everything and prints a QR code to pair the mobile app
 #
 # Usage:
 #   scripts/moch-serve.sh setup   # default; idempotent — safe to re-run
-#   scripts/moch-serve.sh status
-#   scripts/moch-serve.sh restart | stop
+#   scripts/moch-serve.sh status | restart | stop
 #   scripts/moch-serve.sh qr      # reprint the pairing QR + token
 #   scripts/moch-serve.sh uninstall [--purge]
 #
 # Environment:
-#   MOCH_PORT   port for the WebSocket server (default 9222, so a hermes
-#               install on 9119 keeps working untouched)
-#   MOCH_BIND   bind address (default 0.0.0.0 — the phone must reach it)
+#   MOCH_PORT        backend port on loopback   (default 9222)
+#   MOCH_PROXY_PORT  phone-facing proxy port    (default 9223)
 #
 # The hermes internals stay as installed; this script only layers the mobile
 # service on top and never touches a ~/.hermes install or its `hermes` command.
@@ -27,13 +31,14 @@
 set -euo pipefail
 
 MOCH_HOME="${HERMES_HOME:-$HOME/.moch}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$MOCH_HOME/moch-backend"
 MOCH_CMD="$INSTALL_DIR/.hermes/bin/hermes"
 ENV_FILE="$HOME/.config/moch-serve.env"
 UNIT_DIR="$HOME/.config/systemd/user"
 BIN_DIR="$HOME/.local/bin"
 MOCH_PORT="${MOCH_PORT:-9222}"
-MOCH_BIND="${MOCH_BIND:-0.0.0.0}"
+MOCH_PROXY_PORT="${MOCH_PROXY_PORT:-9223}"
 MOCH_COMMAND="${MOCH_COMMAND:-moch}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
@@ -51,15 +56,26 @@ require_install() {
     fi
 }
 
-# The checkout launcher is `exec <store-python> -I -c <script>`; the managed
-# interpreter in line 2 carries the dependency environment (incl. qrcode).
+# The checkout launcher is `exec <store-python> -I -c <script>` (path bare or
+# quoted); the managed interpreter on that line carries the dependency
+# environment under an HERMES_HOME-scoped tools prefix.
 store_python() {
     local py
-    py="$(sed -n "s/^exec '\([^']*\)' .*/\1/p" "$MOCH_CMD" 2>/dev/null | head -1)"
+    py="$(awk '/^exec /{print $2; exit}' "$MOCH_CMD" 2>/dev/null)"
+    py="${py%\'}"; py="${py#\'}"; py="${py%\"}"; py="${py#\"}"
     if [ -n "$py" ] && [ -x "$py" ]; then
         printf '%s' "$py"
         return 0
     fi
+    return 1
+}
+
+# Node for the proxy: prefer the system one, else pm's managed runtime.
+node_bin() {
+    local n
+    if n="$(command -v node)"; then printf '%s' "$n"; return 0; fi
+    n="$(ls -d "$MOCH_HOME"/tools/node-*/bin/node 2>/dev/null | sort -V | tail -1)"
+    if [ -n "$n" ] && [ -x "$n" ]; then printf '%s' "$n"; return 0; fi
     return 1
 }
 
@@ -103,6 +119,11 @@ EOF
 }
 
 install_units() {
+    local node
+    if ! node="$(node_bin)"; then
+        log_error "No node found (system or managed) — the phone proxy needs it."
+        exit 1
+    fi
     mkdir -p "$UNIT_DIR"
     cat > "$UNIT_DIR/moch-serve.service" <<EOF
 [Unit]
@@ -114,7 +135,23 @@ Wants=network-online.target
 EnvironmentFile=$ENV_FILE
 Environment=HERMES_HOME=$MOCH_HOME
 WorkingDirectory=$MOCH_HOME
-ExecStart=$MOCH_CMD serve --host $MOCH_BIND --port $MOCH_PORT
+ExecStart=$MOCH_CMD serve --host 127.0.0.1 --port $MOCH_PORT
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    cat > "$UNIT_DIR/moch-proxy.service" <<EOF
+[Unit]
+Description=Moch phone proxy (LAN/Tailnet -> loopback, Host rewrite)
+After=moch-serve.service
+Wants=moch-serve.service
+
+[Service]
+Environment=PORT=$MOCH_PROXY_PORT
+Environment=UPSTREAM_PORT=$MOCH_PORT
+ExecStart=$node $INSTALL_DIR/scripts/moch-proxy.js
 Restart=on-failure
 RestartSec=5
 
@@ -147,7 +184,11 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl --user daemon-reload
-    log_success "Installed systemd user units (moch-serve, moch-cron.timer)"
+    log_success "Installed systemd user units (moch-serve, moch-proxy, moch-cron.timer)"
+    # User units only run at boot while the user has a session — or lingering.
+    if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q '^Linger=yes'; then
+        log_info "Headless server? Enable boot startup with:  sudo loginctl enable-linger $USER"
+    fi
 }
 
 port_open() {
@@ -155,20 +196,21 @@ port_open() {
 }
 
 start_services() {
-    systemctl --user enable --now moch-serve.service >/dev/null 2>&1 \
-        || systemctl --user restart moch-serve.service
-    systemctl --user enable --now moch-cron.timer >/dev/null 2>&1 \
-        || systemctl --user restart moch-cron.timer
+    # Always restart when units were rewritten: `enable --now` alone leaves an
+    # already-running service on its old ExecStart/env (seen with a bind change).
+    systemctl --user enable moch-serve.service moch-proxy.service moch-cron.timer >/dev/null 2>&1 || true
+    systemctl --user restart moch-serve.service moch-proxy.service
+    systemctl --user start moch-cron.timer >/dev/null 2>&1 || true
     local i
     for i in $(seq 1 30); do
-        if port_open "$MOCH_PORT"; then
-            log_success "Moch backend is up on port $MOCH_PORT"
+        if port_open "$MOCH_PORT" && port_open "$MOCH_PROXY_PORT"; then
+            log_success "Moch backend up: loopback:$MOCH_PORT, phone-facing :$MOCH_PROXY_PORT"
             return 0
         fi
         sleep 1
     done
-    log_warn "Port $MOCH_PORT not accepting yet — recent logs:"
-    journalctl --user -u moch-serve.service -n 15 --no-pager 2>/dev/null || true
+    log_warn "Ports not accepting yet — recent logs:"
+    journalctl --user -u moch-serve.service -u moch-proxy.service -n 15 --no-pager 2>/dev/null || true
     return 1
 }
 
@@ -179,23 +221,36 @@ print_qr() {
     echo
     echo -e "${BOLD}═══════════════════════ Moch is ready ═══════════════════════${NC}"
     echo
-    if py="$(store_python)"; then
-        "$py" -I - <<PY
-import qrcode
-payload = "moch://pair?host=$host&port=$MOCH_PORT&tls=0&token=$token"
-qr = qrcode.QRCode(border=1)
-qr.add_data(payload)
-qr.print_ascii(invert=True)
+    # Vendored dependency-free generator (scripts/vendor/qrcodegen.py, MIT,
+    # © Project Nayuki) — any python3 renders it; failure never hides the token.
+    py="$(store_python || command -v python3 || true)"
+    if [ -n "$py" ]; then
+        "$py" - "$SCRIPT_DIR/vendor" "$host" "$MOCH_PROXY_PORT" "$token" <<'PY' \
+            || log_warn "QR rendering failed — pair with the text values below"
+import sys
+sys.path.insert(0, sys.argv[1])
+from qrcodegen import QrCode
+payload = "moch://pair?host=%s&port=%s&tls=0&token=%s" % tuple(sys.argv[2:5])
+qr = QrCode.encode_text(payload, QrCode.Ecc.MEDIUM)
+b, get = qr.get_size(), qr.get_module
+for y in range(-2, b + 2, 2):
+    print("".join(
+        "█" if (get(x, y) if 0 <= x < b and 0 <= y < b else False)
+             and (get(x, y + 1) if 0 <= x < b and 0 <= y + 1 < b else False)
+        else "▀" if (get(x, y) if 0 <= x < b and 0 <= y < b else False)
+        else "▄" if (get(x, y + 1) if 0 <= x < b and 0 <= y + 1 < b else False)
+        else " "
+        for x in range(-2, b + 2)))
 PY
     else
-        log_warn "Managed python not found — printing text pairing only."
+        log_warn "No python found — printing text pairing only."
     fi
     echo " Scan this in the Moch app — or enter manually:"
-    echo -e "   Host:  ${BOLD}$host:$MOCH_PORT${NC}"
+    echo -e "   Host:  ${BOLD}$host:$MOCH_PROXY_PORT${NC}"
     echo -e "   Token: ${BOLD}$token${NC}"
     echo
     echo " On your Tailnet? Use the machine's tailscale hostname instead, and"
-    echo " expose it securely:   tailscale serve --bg tcp:$MOCH_PORT"
+    echo " expose it securely:   tailscale serve --bg tcp:$MOCH_PROXY_PORT"
     echo
     echo " Next steps:"
     echo "   moch auth login    # add a model provider key (needed before chatting)"
@@ -213,7 +268,7 @@ cmd_setup() {
         start_services
     else
         log_warn "systemd --user unavailable — skipping service install."
-        log_warn "Run the backend manually:  HERMES_HOME=$MOCH_HOME $MOCH_CMD serve --host $MOCH_BIND --port $MOCH_PORT"
+        log_warn "Run the backend manually:  HERMES_HOME=$MOCH_HOME $MOCH_CMD serve --host 127.0.0.1 --port $MOCH_PORT"
     fi
     print_qr
 }
@@ -221,26 +276,27 @@ cmd_setup() {
 cmd_status() {
     require_install
     echo -e "${BOLD}moch backend${NC}  (home: $MOCH_HOME)"
-    if systemctl --user is-active --quiet moch-serve.service 2>/dev/null; then
-        log_success "moch-serve.service active"
-    else
-        log_warn "moch-serve.service inactive (see: journalctl --user -u moch-serve.service -n 30)"
-    fi
-    if systemctl --user is-active --quiet moch-cron.timer 2>/dev/null; then
-        log_success "moch-cron.timer active"
-    else
-        log_warn "moch-cron.timer inactive"
-    fi
-    port_open "$MOCH_PORT" && log_success "port $MOCH_PORT accepting connections" \
-        || log_warn "port $MOCH_PORT not accepting"
+    local u ok=1
+    for u in moch-serve.service moch-proxy.service moch-cron.timer; do
+        if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+            log_success "$u active"
+        else
+            log_warn "$u inactive (see: journalctl --user -u $u -n 30)"
+            ok=0
+        fi
+    done
+    port_open "$MOCH_PORT" && log_success "loopback:$MOCH_PORT accepting" || { log_warn "loopback:$MOCH_PORT not accepting"; ok=0; }
+    port_open "$MOCH_PROXY_PORT" && log_success "phone port :$MOCH_PROXY_PORT accepting" || { log_warn "phone port :$MOCH_PROXY_PORT not accepting"; ok=0; }
+    [ "$ok" = 1 ] || exit 1
 }
 
-cmd_restart() { require_install; systemctl --user restart moch-serve.service && log_success "restarted"; }
-cmd_stop()    { systemctl --user stop moch-serve.service moch-cron.timer && log_success "stopped"; }
+cmd_restart() { require_install; systemctl --user restart moch-serve.service moch-proxy.service && log_success "restarted"; }
+cmd_stop()    { systemctl --user stop moch-serve.service moch-proxy.service moch-cron.timer && log_success "stopped"; }
 
 cmd_uninstall() {
-    systemctl --user disable --now moch-serve.service moch-cron.timer >/dev/null 2>&1 || true
-    rm -f "$UNIT_DIR/moch-serve.service" "$UNIT_DIR/moch-cron.service" "$UNIT_DIR/moch-cron.timer"
+    systemctl --user disable --now moch-serve.service moch-proxy.service moch-cron.timer >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/moch-serve.service" "$UNIT_DIR/moch-proxy.service" \
+          "$UNIT_DIR/moch-cron.service" "$UNIT_DIR/moch-cron.timer"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     rm -f "$BIN_DIR/$MOCH_COMMAND"
     log_success "Removed services and the \`$MOCH_COMMAND\` command."
