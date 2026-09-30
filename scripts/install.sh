@@ -456,7 +456,47 @@ stage_prerequisites() {
     log_success "prerequisites ok (git, curl)"
 }
 
+# Moch: fresh installs fetch a source snapshot over one fast CDN stream
+# instead of cloning — no git history, no server pack-prep stalls. Updates
+# re-run the installer (the code directory is replaced wholesale; user data
+# lives in $HERMES_HOME proper and is never touched). MOCH_GIT=1 forces the
+# upstream clone path; any failure here falls back to it automatically.
+moch_tarball_fetch() {
+    [ "${MOCH_GIT:-}" = 1 ] && return 1
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        return 1   # a git checkout from an older install keeps its update path
+    fi
+    local url="https://codeload.github.com/SoftLand-Tech/moch/tar.gz/refs/heads/$BRANCH"
+    local staged
+    mkdir -p "$(dirname "$INSTALL_DIR")"
+    rm -rf "$(dirname "$INSTALL_DIR")"/.hermes-clone-* "$(dirname "$INSTALL_DIR")"/.moch-tarball-* 2>/dev/null || true
+    staged="$(mktemp -d "$(dirname "$INSTALL_DIR")/.moch-tarball-XXXXXX")" || fail "cannot stage snapshot"
+    if ! run_logged "Downloading Moch source snapshot ($BRANCH)" \
+        curl -fsSL --retry 3 -o "$staged/src.tar.gz" "$url"; then
+        rm -rf "$staged"
+        return 1
+    fi
+    run_logged "Extracting source" tar -xzf "$staged/src.tar.gz" -C "$staged" \
+        || { rm -rf "$staged"; return 1; }
+    local extracted
+    extracted="$(find "$staged" -maxdepth 1 -type d -name 'moch-*' | head -1)"
+    if [ -z "$extracted" ]; then
+        rm -rf "$staged"
+        return 1
+    fi
+    if [ -d "$INSTALL_DIR" ]; then
+        run_logged "Replacing previous snapshot" rm -rf "$INSTALL_DIR" || { rm -rf "$staged"; return 1; }
+    fi
+    mkdir -p "$(dirname "$INSTALL_DIR")"
+    mv "$extracted" "$INSTALL_DIR" || { rm -rf "$staged"; return 1; }
+    rm -rf "$staged"
+    echo "tarball" > "$INSTALL_DIR/.install_method"
+    log_success "Source snapshot ready (74 MB, no git history)"
+    return 0
+}
+
 stage_repository() {
+    if moch_tarball_fetch; then return 0; fi
     # An interrupted clone from an older installer can leave a .git with no
     # initial commit, where stash/checkout abort ("You do not have the
     # initial commit yet", #40998). Move it aside -- never delete it, it may
