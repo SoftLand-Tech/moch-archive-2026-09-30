@@ -352,11 +352,17 @@ install_moch_command() {
     fi
     mkdir -p "$BIN_DIR"
     # Same routing as the npm shim: control subcommands → moch-serve.sh,
-    # anything else → the backend's own CLI (moch auth login, moch cron …).
+    # bare `moch` → the node wizard when possible (nicer for non-terminal
+    # people), anything else → the backend's own CLI.
     cat > "$BIN_DIR/$MOCH_COMMAND" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
-  ""|setup|status|restart|stop|qr|import-hermes|uninstall) exec "$INSTALL_DIR/scripts/moch-serve.sh" "\$@" ;;
+  "")
+    if command -v node >/dev/null 2>&1 && [ -f "$INSTALL_DIR/npm/bin/moch.js" ]; then
+      exec node "$INSTALL_DIR/npm/bin/moch.js" "\$@"
+    fi
+    exec "$INSTALL_DIR/scripts/moch-serve.sh" setup ;;
+  setup|status|restart|stop|qr|import-hermes|uninstall) exec "$INSTALL_DIR/scripts/moch-serve.sh" "\$@" ;;
   *) export HERMES_HOME="$MOCH_HOME"; exec "$MOCH_CMD" "\$@" ;;
 esac
 EOF
@@ -627,6 +633,49 @@ PY
     echo -e "${BOLD}═════════════════════════════════════════════════════════════${NC}"
 }
 
+# Machine-readable pairing state for the interactive wizard (bin/wizard.js).
+# KEY=VALUE lines; HOST empty means tailnet pairing is not available yet.
+cmd_pairinfo() {
+    require_install
+    local state="down" ts="absent" host=""
+    if port_open "$MOCH_PORT" && port_open "$MOCH_PROXY_PORT"; then state="up"; fi
+    if ts_find_daemon; then
+        case "$(ts_backend_state)" in
+            Running) ts="running" ;;
+            *)       ts="needs-login" ;;
+        esac
+    fi
+    [ "$ts" = "running" ] && host="$(ts_dns_name)"
+    printf 'SERVICES=%s\nTS=%s\nHOST=%s\nLAN=%s\nTOKEN=%s\n' \
+        "$state" "$ts" "$host" "$(lan_ip):$MOCH_PROXY_PORT" "$(token_value)"
+}
+
+# Link the tailnet, wizard-friendly protocol on stdout (one line per event):
+#   URL <login-url>   sign-in needed — open the URL in a browser
+#   LINKED <host>     linked and serve published — pairing ready from anywhere
+#   FAIL <reason>     could not link (caller falls back to LAN pairing)
+cmd_ts_link() {
+    require_install
+    local i out url h
+    ts_find_daemon || install_tailscale_user || { echo "FAIL no-tailscale"; return 0; }
+    ts_find_daemon || { echo "FAIL no-daemon"; return 0; }
+    if [ "$(ts_backend_state)" != "Running" ]; then
+        out="$(ts_ctl up --timeout=10s 2>&1 || true)"
+        url="$(printf '%s' "$out" | sed -n 's/.*\(https:\/\/login\.tailscale\.com[^ ]*\).*/\1/p' | head -1)"
+        [ -n "$url" ] || { echo "FAIL no-url"; return 0; }
+        echo "URL $url"
+        for i in $(seq 1 60); do
+            sleep 5
+            [ "$(ts_backend_state)" = "Running" ] && break
+        done
+        [ "$(ts_backend_state)" = "Running" ] || { echo "FAIL timeout"; return 0; }
+    fi
+    ts_ctl serve --bg "http://127.0.0.1:$MOCH_PROXY_PORT" >/dev/null 2>&1 || { echo "FAIL serve"; return 0; }
+    h="$(ts_dns_name)"
+    [ -n "$h" ] || { echo "FAIL dns"; return 0; }
+    echo "LINKED $h"
+}
+
 # First run on a machine that already has Hermes: offer to bring its data over.
 maybe_offer_hermes_import() {
     [ -d "$HOME/.hermes" ] || return 0
@@ -773,6 +822,7 @@ case "${1:-setup}" in
     stop)      cmd_stop ;;
     qr)        require_install; ensure_token; ts_pair_host || true; print_qr ;;
     import-hermes) shift; exec bash "$SCRIPT_DIR/moch-import-hermes.sh" "$@" ;;
+    pairinfo|ts-link) "cmd_${1//-/_}" ;;
     uninstall) shift; cmd_uninstall "${1:-}" ;;
     *) echo "Usage: moch-serve.sh {setup|status|restart|stop|qr|import-hermes|uninstall [--purge]}"; exit 1 ;;
 esac
