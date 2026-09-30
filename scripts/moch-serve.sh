@@ -225,7 +225,7 @@ start_services() {
 print_qr() {
     local host token py
     host="$(lan_ip)"
-    token="$(token_value)"    echo
+    token="$(token_value)"
     echo -e "${BOLD}═══════════════════════ Moch is ready ═══════════════════════${NC}"
     echo
     # Vendored dependency-free generator (scripts/vendor/qrcodegen.py, MIT,
@@ -237,7 +237,7 @@ print_qr() {
 import sys
 sys.path.insert(0, sys.argv[1])
 from qrcodegen import QrCode
-payload = "moch://pair?host=%s&port=%s&tls=0&token=%s" % tuple(sys.argv[2:5])
+payload = "hermes://connect?host=%s:%s&tls=0&token=%s" % tuple(sys.argv[2:5])
 qr = QrCode.encode_text(payload, QrCode.Ecc.MEDIUM)
 b, get = qr.get_size(), qr.get_module
 for y in range(-2, b + 2, 2):
@@ -255,6 +255,7 @@ PY
     echo " Scan this in the Moch app — or enter manually:"
     echo -e "   Host:  ${BOLD}$host:$MOCH_PROXY_PORT${NC}"
     echo -e "   Token: ${BOLD}$token${NC}"
+    echo -e "   Link:  ${BOLD}hermes://connect?host=$host:$MOCH_PROXY_PORT&tls=0&token=$token${NC}"
     echo
     echo " On your Tailnet? Use the machine's tailscale hostname instead, and"
     echo " expose it securely:   tailscale serve --bg tcp:$MOCH_PROXY_PORT"
@@ -345,7 +346,7 @@ case "${1:-setup}" in
     status)    cmd_status ;;
     restart)   cmd_restart ;;
     stop)      cmd_stop ;;
-    qr)        require_install; print_qr ;;
+    qr)        require_install; ensure_token; print_qr ;;
     import-hermes) shift; exec bash "$SCRIPT_DIR/moch-import-hermes.sh" "$@" ;;
     uninstall) shift; cmd_uninstall "${1:-}" ;;
     *) echo "Usage: moch-serve.sh {setup|status|restart|stop|qr|import-hermes|uninstall [--purge]}"; exit 1 ;;

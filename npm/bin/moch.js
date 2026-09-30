@@ -57,9 +57,16 @@ if (args.includes('--help') || args.includes('-h')) {
   process.exit(0)
 }
 
+// Installed + bare `moch` → the phone experience: idempotent setup that
+// verifies services and reprints the pairing QR + links. Never the CLI/TUI.
+if (fs.existsSync(serveScript) && args.length === 0) {
+  const run = spawnSync('bash', [serveScript, 'setup'], { stdio: 'inherit', env: process.env })
+  process.exit(run.status ?? 1)
+}
+
 // Installed + anything else non-flag (auth login, cron, skills, doctor, …)
 // → the backend's own CLI, HERMES_HOME-scoped.
-if (fs.existsSync(serveScript) && !isFlag) {
+if (fs.existsSync(serveScript) && args.length > 0 && !isFlag) {
   const hermes = path.join(os.homedir(), '.moch', 'moch-backend', '.hermes', 'bin', 'hermes')
   if (fs.existsSync(hermes)) {
     const run = spawnSync(hermes, args, {
