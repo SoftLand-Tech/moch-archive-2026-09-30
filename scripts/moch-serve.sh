@@ -204,17 +204,30 @@ ensure_tailscale() {
             ts_ctl up --timeout=180s \
                 || { log_warn "Login not finished — LAN pairing for now. Re-run \`moch\` to retry."; return 0; }
         else
-            local url out
+            local url out i
             out="$(ts_ctl up --timeout=10s 2>&1 || true)"
             url="$(printf '%s' "$out" | sed -n 's/.*\(https:\/\/login\.tailscale\.com[^ ]*\).*/\1/p' | head -1)"
             log_info "Remote pairing needs a one-time tailscale sign-in:"
             if [ -n "$url" ]; then
-                log_info "  1. open: $url"
-                log_info "  2. re-run: moch   (publishes the works-anywhere QR)"
+                log_info "  open this in any browser — sign in (or create a free"
+                log_info "  account) with the SAME account the phone's Tailscale"
+                log_info "  app will use:"
+                echo
+                echo -e "    ${BOLD}$url${NC}"
+                echo
+                log_info "  waiting up to 2 min for the sign-in… (re-run \`moch\` anytime later)"
+                for i in $(seq 1 24); do
+                    sleep 5
+                    [ "$(ts_backend_state)" = "Running" ] && break
+                done
+                if [ "$(ts_backend_state)" != "Running" ]; then
+                    log_warn "Login not finished yet — LAN pairing for now. Open the link above, then re-run: moch"
+                    return 0
+                fi
             else
                 log_info "  run \`moch\` in a terminal to sign in."
+                return 0
             fi
-            return 0
         fi
     fi
     if ts_ctl serve --bg "http://127.0.0.1:$MOCH_PROXY_PORT" >/dev/null 2>&1; then
@@ -404,7 +417,8 @@ PY
     echo " Scan this in the Moch app — or enter manually:"
     if [ -n "$TS_HOST" ]; then
         echo " Works from ANY network (Wi-Fi, mobile data, away from home) —"
-        echo " needs the Tailscale app on the phone, connected to this tailnet:"
+        echo " needs the Tailscale app on the phone, signed in to the SAME"
+        echo " account as this machine, and connected:"
         echo -e "   Host:  ${BOLD}wss://$TS_HOST${NC}"
         echo -e "   Token: ${BOLD}$token${NC}"
         echo -e "   Link:  ${BOLD}hermes://connect?host=$TS_HOST&tls=1&token=$token${NC}"
