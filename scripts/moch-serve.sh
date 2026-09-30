@@ -4,16 +4,21 @@
 # ============================================================================
 # Turns a fresh `moch-backend` install into a running phone-ready backend:
 #   • generates a persistent pairing token   (~/.config/moch-serve.env)
-#   • installs systemd user units:
+#   • installs service units for the platform:
+#     Linux: systemd user units
 #       moch-serve.service  — `serve` on 127.0.0.1:<port> (token auth is
 #                             loopback-only in hermes >= 0.21.3)
 #       moch-proxy.service  — scripts/moch-proxy.js on 0.0.0.0:<proxy-port>,
 #                             rewriting Host so phones on LAN/Tailnet can pair
 #       moch-cron.timer     — one `cron tick` per minute (scheduled jobs
 #                             without the always-on messaging gateway)
+#     macOS: the same three as launchd agents in ~/Library/LaunchAgents
+#       (com.moch.serve / com.moch.proxy / com.moch.cron)
 #   • links the machine to a Tailscale tailnet (best-effort, no root):
-#       tailscaled.service  — userspace-networking daemon; if tailscale is
-#                             missing it is installed into ~/.local/bin
+#       Linux  — static tailscaled into ~/.local/bin + systemd user unit
+#       macOS  — binaries via Homebrew (no sudo), run as our own rootless
+#                userspace launchd agent (com.moch.tailscaled); an existing
+#                system tailscale / Mac App Store install is detected and used
 #       tailscale serve     — publishes wss://<host>.ts.net → the proxy, so
 #                             the phone pairs over the tailnet from ANY
 #                             network (Wi-Fi, mobile data, away from home)
@@ -97,16 +102,30 @@ node_bin() {
 }
 
 lan_ip() {
-    ip -4 route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
-        || hostname -I 2>/dev/null | awk '{print $1; exit}' \
-        || echo "127.0.0.1"
+    case "$(uname -s)" in
+        Darwin)
+            # en0 is the default on modern macs; en1 covers USB adapters.
+            ipconfig getifaddr en0 2>/dev/null \
+                || ipconfig getifaddr en1 2>/dev/null \
+                || echo "127.0.0.1"
+            ;;
+        *)
+            ip -4 route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
+                || hostname -I 2>/dev/null | awk '{print $1; exit}' \
+                || echo "127.0.0.1"
+            ;;
+    esac
 }
 
 # ---- Tailscale: pairing that works from ANY network -------------------------
 # The tailnet name gives the phone a wss:// endpoint with a real TLS cert,
 # reachable over WireGuard from any network — no router ports, no public
 # exposure. Every step is best-effort: on any failure the QR stays LAN-only.
-ts_ctl() { "$TS_CLI" --socket="$TS_SOCKET" "$@"; }
+ts_ctl() {
+    # TS_NO_SOCKET=1 → CLI's own default transport (macOS GUI-app variant
+    # owns its socket; passing --socket there breaks it).
+    if [ "${TS_NO_SOCKET:-0}" = "1" ]; then "$TS_CLI" "$@"; else "$TS_CLI" --socket="$TS_SOCKET" "$@"; fi
+}
 
 # Daemon state string ("Running", "NeedsLogin", …); empty output = unreachable.
 ts_backend_state() {
@@ -117,17 +136,23 @@ ts_dns_name() {
     ts_ctl status --json 2>/dev/null | sed -n 's/.*"DNSName": *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//'
 }
 
-# Find a live daemon: ours (user unit socket) first, then a system tailscaled.
+# Find a live daemon: ours (user socket) first, then a system tailscaled
+# (default socket), then the CLI's own default (macOS Tailscale.app). Checks
+# each candidate CLI against every transport before moving to the next.
 ts_find_daemon() {
     if [ -n "$TS_CLI" ]; then return 0; fi
     local c
-    for c in "$BIN_DIR/tailscale" "$(command -v tailscale || true)"; do
+    for c in "$BIN_DIR/tailscale" "$(command -v tailscale || true)" \
+             "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; do
         [ -n "$c" ] && [ -x "$c" ] || continue
-        TS_CLI="$c"
+        TS_CLI="$c"; TS_NO_SOCKET=0
         TS_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/tailscaled.sock"
         [ -n "$(ts_backend_state)" ] && return 0
         TS_SOCKET="/var/run/tailscale/tailscaled.sock"
         [ -n "$(ts_backend_state)" ] && return 0
+        TS_NO_SOCKET=1
+        [ -n "$("$TS_CLI" status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([^"]*\)".*/\1/p' | head -1)" ] && return 0
+        TS_NO_SOCKET=0
     done
     TS_CLI=""
     TS_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/tailscaled.sock"
@@ -135,7 +160,14 @@ ts_find_daemon() {
 }
 
 install_tailscale_user() {
-    [ "$(uname -s)" = "Linux" ] || { log_info "Not Linux — remote (tailnet) pairing skipped, LAN only."; return 1; }
+    case "$(uname -s)" in
+        Linux)  install_tailscale_linux ;;
+        Darwin) install_tailscale_darwin ;;
+        *) log_info "No tailscale auto-install for $(uname -s) — LAN pairing only."; return 1 ;;
+    esac
+}
+
+install_tailscale_linux() {
     local arch tgz tmp dir
     case "$(uname -m)" in
         x86_64)  arch=amd64 ;;
@@ -176,6 +208,57 @@ EOF
     systemctl --user enable --now tailscaled.service >/dev/null 2>&1 \
         || { log_warn "tailscaled failed to start — LAN pairing only."; return 1; }
     TS_CLI="$BIN_DIR/tailscale"
+    local i
+    for i in $(seq 1 10); do
+        [ -n "$(ts_backend_state)" ] && return 0
+        sleep 1
+    done
+    log_warn "tailscaled not responding — LAN pairing only."
+    return 1
+}
+
+install_tailscale_darwin() {
+    # Homebrew only FETCHES the binaries — brew's own service runs tailscaled
+    # as root, which we don't want. We run the binaries as our own rootless
+    # userspace launchd agent, mirroring the Linux user unit exactly.
+    if ! command -v brew >/dev/null 2>&1; then
+        log_info "macOS: install Homebrew (https://brew.sh) or the Tailscale app"
+        log_info "from the Mac App Store, then re-run: moch  (LAN pairing meanwhile)"
+        return 1
+    fi
+    if ! command -v tailscaled >/dev/null 2>&1; then
+        log_info "Installing tailscale via Homebrew (one time)…"
+        brew install tailscale \
+            || { log_warn "brew install failed — LAN pairing only."; return 1; }
+        log_success "tailscale installed via Homebrew"
+    fi
+    local bin
+    bin="$(dirname "$(command -v tailscaled)")"
+    mkdir -p "$TS_STATE_DIR" "$HOME/Library/LaunchAgents"
+    cat > "$HOME/Library/LaunchAgents/com.moch.tailscaled.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.moch.tailscaled</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$bin/tailscaled</string>
+        <string>--tun=userspace-networking</string>
+        <string>--socket=$TS_SOCKET</string>
+        <string>--statedir=$TS_STATE_DIR</string>
+        <string>--socks5-server=localhost:$TS_SOCKS_PORT</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$TS_STATE_DIR/tailscaled.log</string>
+    <key>StandardErrorPath</key><string>$TS_STATE_DIR/tailscaled.log</string>
+</dict>
+</plist>
+EOF
+    launchctl_load com.moch.tailscaled \
+        || { log_warn "tailscaled launch agent failed to load — LAN pairing only."; return 1; }
+    TS_CLI="$bin/tailscale"
     local i
     for i in $(seq 1 10); do
         [ -n "$(ts_backend_state)" ] && return 0
@@ -358,6 +441,109 @@ port_open() {
     (exec 3<>"/dev/tcp/127.0.0.1/$1" && exec 3>&-) 2>/dev/null
 }
 
+# ---- macOS: launchd agents instead of systemd user units --------------------
+LA_DIR="$HOME/Library/LaunchAgents"
+MOCH_LABELS="com.moch.serve com.moch.proxy com.moch.cron"
+
+launchctl_load() {
+    local label="$1"
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$LA_DIR/$label.plist" \
+        || launchctl load -w "$LA_DIR/$label.plist" \
+        || { log_warn "$label failed to load"; return 1; }
+}
+
+launchctl_unload() {
+    launchctl bootout "gui/$(id -u)/$1" >/dev/null 2>&1 \
+        || launchctl unload -w "$LA_DIR/$1.plist" >/dev/null 2>&1 || true
+}
+
+plist_head() { # label logfile -> common plist skeleton on stdout
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0">\n<dict>\n'
+    printf '    <key>Label</key><string>%s</string>\n' "$1"
+    printf '    <key>StandardOutPath</key><string>%s</string>\n' "$2"
+    printf '    <key>StandardErrorPath</key><string>%s</string>\n' "$2"
+}
+
+plist_tail() { printf '</dict>\n</plist>\n'; }
+
+install_units_darwin() {
+    local node token
+    if ! node="$(node_bin)"; then
+        log_error "No node found (system or managed) — the phone proxy needs it."
+        exit 1
+    fi
+    token="$(token_value)"
+    mkdir -p "$LA_DIR" "$MOCH_HOME/logs"
+
+    # Backend — the pairing token must ride the plist (launchd has no
+    # EnvironmentFile); the file is chmod 600 like the env file itself.
+    { plist_head com.moch.serve "$MOCH_HOME/logs/moch-serve.launchd.log"
+      printf '    <key>ProgramArguments</key>\n    <array>\n'
+      printf '        <string>%s</string>\n        <string>serve</string>\n' "$MOCH_CMD"
+      printf '        <string>--host</string>\n        <string>127.0.0.1</string>\n'
+      printf '        <string>--port</string>\n        <string>%s</string>\n    </array>\n' "$MOCH_PORT"
+      printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
+      printf '        <key>HERMES_HOME</key><string>%s</string>\n' "$MOCH_HOME"
+      printf '        <key>HERMES_DASHBOARD_SESSION_TOKEN</key><string>%s</string>\n' "$token"
+      printf '    </dict>\n'
+      printf '    <key>WorkingDirectory</key><string>%s</string>\n' "$MOCH_HOME"
+      printf '    <key>RunAtLoad</key><true/>\n    <key>KeepAlive</key><true/>\n'
+      plist_tail; } > "$LA_DIR/com.moch.serve.plist"
+    chmod 600 "$LA_DIR/com.moch.serve.plist"
+
+    # Phone-facing proxy
+    { plist_head com.moch.proxy "$MOCH_HOME/logs/moch-proxy.launchd.log"
+      printf '    <key>ProgramArguments</key>\n    <array>\n'
+      printf '        <string>%s</string>\n        <string>%s/scripts/moch-proxy.js</string>\n    </array>\n' "$node" "$INSTALL_DIR"
+      printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
+      printf '        <key>PORT</key><string>%s</string>\n' "$MOCH_PROXY_PORT"
+      printf '        <key>UPSTREAM_PORT</key><string>%s</string>\n' "$MOCH_PORT"
+      printf '    </dict>\n'
+      printf '    <key>RunAtLoad</key><true/>\n    <key>KeepAlive</key><true/>\n'
+      plist_tail; } > "$LA_DIR/com.moch.proxy.plist"
+
+    # Scheduled jobs — one tick per minute (launchd has no */1 cron sugar;
+    # an explicit Minute list does the same).
+    { plist_head com.moch.cron "$MOCH_HOME/logs/moch-cron.launchd.log"
+      printf '    <key>ProgramArguments</key>\n    <array>\n'
+      printf '        <string>%s</string>\n        <string>cron</string>\n        <string>tick</string>\n    </array>\n' "$MOCH_CMD"
+      printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
+      printf '        <key>HERMES_HOME</key><string>%s</string>\n' "$MOCH_HOME"
+      printf '        <key>HERMES_DASHBOARD_SESSION_TOKEN</key><string>%s</string>\n' "$token"
+      printf '    </dict>\n'
+      printf '    <key>WorkingDirectory</key><string>%s</string>\n' "$MOCH_HOME"
+      printf '    <key>StartCalendarInterval</key>\n    <array>\n'
+      local m
+      for m in $(seq 0 59); do
+          printf '        <dict><key>Minute</key><integer>%s</integer></dict>\n' "$m"
+      done
+      printf '    </array>\n'
+      plist_tail; } > "$LA_DIR/com.moch.cron.plist"
+
+    local u ok=0
+    for u in $MOCH_LABELS; do launchctl_load "$u" || ok=1; done
+    [ "$ok" = 0 ] && log_success "Installed launchd agents (com.moch.serve, com.moch.proxy, com.moch.cron)"
+    return 0
+}
+
+start_services_darwin() {
+    local i
+    for i in $(seq 1 30); do
+        if port_open "$MOCH_PORT" && port_open "$MOCH_PROXY_PORT"; then
+            log_success "Moch backend up: loopback:$MOCH_PORT, phone-facing :$MOCH_PROXY_PORT"
+            return 0
+        fi
+        sleep 1
+    done
+    log_warn "Ports not accepting yet — recent logs:"
+    tail -n 15 "$MOCH_HOME/logs/moch-serve.launchd.log" "$MOCH_HOME/logs/moch-proxy.launchd.log" 2>/dev/null || true
+    return 1
+}
+
+
 start_services() {
     # Always restart when units were rewritten: `enable --now` alone leaves an
     # already-running service on its old ExecStart/env (seen with a bind change).
@@ -468,14 +654,22 @@ cmd_setup() {
     require_install
     ensure_token
     install_moch_command
-    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-        install_units
-        start_services
-        ensure_tailscale
-    else
-        log_warn "systemd --user unavailable — skipping service install."
-        log_warn "Run the backend manually:  HERMES_HOME=$MOCH_HOME $MOCH_CMD serve --host 127.0.0.1 --port $MOCH_PORT"
-    fi
+    case "$(uname -s)" in
+        Darwin)
+            install_units_darwin
+            start_services_darwin
+            ;;
+        *)
+            if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+                install_units
+                start_services
+            else
+                log_warn "systemd --user unavailable — skipping service install."
+                log_warn "Run the backend manually:  HERMES_HOME=$MOCH_HOME $MOCH_CMD serve --host 127.0.0.1 --port $MOCH_PORT"
+            fi
+            ;;
+    esac
+    ensure_tailscale
     maybe_offer_hermes_import
     print_qr
 }
@@ -484,14 +678,28 @@ cmd_status() {
     require_install
     echo -e "${BOLD}moch backend${NC}  (home: $MOCH_HOME)"
     local u ok=1
-    for u in moch-serve.service moch-proxy.service moch-cron.timer; do
-        if systemctl --user is-active --quiet "$u" 2>/dev/null; then
-            log_success "$u active"
-        else
-            log_warn "$u inactive (see: journalctl --user -u $u -n 30)"
-            ok=0
-        fi
-    done
+    case "$(uname -s)" in
+        Darwin)
+            for u in $MOCH_LABELS; do
+                if launchctl print "gui/$(id -u)/$u" >/dev/null 2>&1; then
+                    log_success "$u loaded"
+                else
+                    log_warn "$u not loaded (logs: $MOCH_HOME/logs)"
+                    ok=0
+                fi
+            done
+            ;;
+        *)
+            for u in moch-serve.service moch-proxy.service moch-cron.timer; do
+                if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+                    log_success "$u active"
+                else
+                    log_warn "$u inactive (see: journalctl --user -u $u -n 30)"
+                    ok=0
+                fi
+            done
+            ;;
+    esac
     port_open "$MOCH_PORT" && log_success "loopback:$MOCH_PORT accepting" || { log_warn "loopback:$MOCH_PORT not accepting"; ok=0; }
     port_open "$MOCH_PROXY_PORT" && log_success "phone port :$MOCH_PROXY_PORT accepting" || { log_warn "phone port :$MOCH_PROXY_PORT not accepting"; ok=0; }
     if ts_pair_host; then
@@ -502,19 +710,55 @@ cmd_status() {
     [ "$ok" = 1 ] || exit 1
 }
 
-cmd_restart() { require_install; systemctl --user restart moch-serve.service moch-proxy.service && log_success "restarted"; }
-cmd_stop()    { systemctl --user stop moch-serve.service moch-proxy.service moch-cron.timer && log_success "stopped"; }
+cmd_restart() {
+    require_install
+    case "$(uname -s)" in
+        Darwin)
+            launchctl_load com.moch.serve
+            launchctl_load com.moch.proxy
+            ;;
+        *)
+            systemctl --user restart moch-serve.service moch-proxy.service
+            ;;
+    esac
+    log_success "restarted"
+}
+
+cmd_stop() {
+    require_install
+    case "$(uname -s)" in
+        Darwin)
+            local u
+            for u in $MOCH_LABELS; do launchctl_unload "$u"; done
+            ;;
+        *)
+            systemctl --user stop moch-serve.service moch-proxy.service moch-cron.timer
+            ;;
+    esac
+    log_success "stopped"
+}
 
 cmd_uninstall() {
     if ts_find_daemon; then ts_ctl serve off >/dev/null 2>&1 || true; fi
-    systemctl --user disable --now moch-serve.service moch-proxy.service moch-cron.timer >/dev/null 2>&1 || true
-    rm -f "$UNIT_DIR/moch-serve.service" "$UNIT_DIR/moch-proxy.service" \
-          "$UNIT_DIR/moch-cron.service" "$UNIT_DIR/moch-cron.timer"
+    case "$(uname -s)" in
+        Darwin)
+            local u
+            for u in $MOCH_LABELS; do launchctl_unload "$u"; done
+            rm -f "$LA_DIR"/com.moch.serve.plist "$LA_DIR"/com.moch.proxy.plist "$LA_DIR"/com.moch.cron.plist
+            ;;
+        *)
+            systemctl --user disable --now moch-serve.service moch-proxy.service moch-cron.timer >/dev/null 2>&1 || true
+            rm -f "$UNIT_DIR/moch-serve.service" "$UNIT_DIR/moch-proxy.service" \
+                  "$UNIT_DIR/moch-cron.service" "$UNIT_DIR/moch-cron.timer"
+            ;;
+    esac
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     rm -f "$BIN_DIR/$MOCH_COMMAND"
     log_success "Removed services and the \`$MOCH_COMMAND\` command."
     if [ "${1:-}" = "--purge" ]; then
         log_warn "Deleting $MOCH_HOME and $ENV_FILE (all sessions, config, history!)"
+        launchctl_unload com.moch.tailscaled 2>/dev/null || true
+        rm -f "$LA_DIR/com.moch.tailscaled.plist"
         rm -rf "$MOCH_HOME"
         rm -f "$ENV_FILE"
     else

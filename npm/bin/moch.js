@@ -78,8 +78,9 @@ if (fs.existsSync(serveScript) && args.length > 0 && !isFlag) {
 }
 
 if (process.platform === 'win32') {
-  console.error('moch: Windows is not supported yet.')
-  console.error('Install WSL2 first, then run this command inside WSL:')
+  console.error('moch: Windows is not supported natively yet.')
+  console.error('Install WSL2 and run moch inside it — inside WSL the setup is the full')
+  console.error('Linux one, including works-anywhere (tailscale) phone pairing:')
   console.error('  curl -fsSL https://raw.githubusercontent.com/SoftLand-Tech/moch/main/scripts/install.sh | bash')
   process.exit(1)
 }
