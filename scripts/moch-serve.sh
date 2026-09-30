@@ -11,6 +11,12 @@
 #                             rewriting Host so phones on LAN/Tailnet can pair
 #       moch-cron.timer     — one `cron tick` per minute (scheduled jobs
 #                             without the always-on messaging gateway)
+#   • links the machine to a Tailscale tailnet (best-effort, no root):
+#       tailscaled.service  — userspace-networking daemon; if tailscale is
+#                             missing it is installed into ~/.local/bin
+#       tailscale serve     — publishes wss://<host>.ts.net → the proxy, so
+#                             the phone pairs over the tailnet from ANY
+#                             network (Wi-Fi, mobile data, away from home)
 #   • installs the `moch` command            (~/.local/bin/moch)
 #   • starts everything and prints a QR code to pair the mobile app
 #
@@ -23,6 +29,7 @@
 # Environment:
 #   MOCH_PORT        backend port on loopback   (default 9222)
 #   MOCH_PROXY_PORT  phone-facing proxy port    (default 9223)
+#   MOCH_NO_TAILSCALE=1  skip the tailscale/remote step (LAN pairing only)
 #
 # The hermes internals stay as installed; this script only layers the mobile
 # service on top and never touches a ~/.hermes install or its `hermes` command.
@@ -40,6 +47,16 @@ BIN_DIR="$HOME/.local/bin"
 MOCH_PORT="${MOCH_PORT:-9222}"
 MOCH_PROXY_PORT="${MOCH_PROXY_PORT:-9223}"
 MOCH_COMMAND="${MOCH_COMMAND:-moch}"
+
+# Tailscale (remote pairing over a private tailnet). Pinned static build; the
+# userspace daemon needs no root and no /dev/tun, so it installs cleanly
+# beside a system tailscale without touching it.
+TS_VERSION="1.102.3"
+TS_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/tailscaled.sock"
+TS_STATE_DIR="$HOME/.local/share/tailscale"
+TS_SOCKS_PORT=1055
+TS_CLI=""          # resolved by ts_find_daemon
+TS_HOST=""         # this machine's <name>.ts.net once linked + serving
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
 BOLD='\033[1m'; NC='\033[0m'
@@ -83,6 +100,131 @@ lan_ip() {
     ip -4 route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
         || hostname -I 2>/dev/null | awk '{print $1; exit}' \
         || echo "127.0.0.1"
+}
+
+# ---- Tailscale: pairing that works from ANY network -------------------------
+# The tailnet name gives the phone a wss:// endpoint with a real TLS cert,
+# reachable over WireGuard from any network — no router ports, no public
+# exposure. Every step is best-effort: on any failure the QR stays LAN-only.
+ts_ctl() { "$TS_CLI" --socket="$TS_SOCKET" "$@"; }
+
+# Daemon state string ("Running", "NeedsLogin", …); empty output = unreachable.
+ts_backend_state() {
+    ts_ctl status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([^"]*\)".*/\1/p' | head -1
+}
+
+ts_dns_name() {
+    ts_ctl status --json 2>/dev/null | sed -n 's/.*"DNSName": *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//'
+}
+
+# Find a live daemon: ours (user unit socket) first, then a system tailscaled.
+ts_find_daemon() {
+    if [ -n "$TS_CLI" ]; then return 0; fi
+    local c
+    for c in "$BIN_DIR/tailscale" "$(command -v tailscale || true)"; do
+        [ -n "$c" ] && [ -x "$c" ] || continue
+        TS_CLI="$c"
+        TS_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/tailscaled.sock"
+        [ -n "$(ts_backend_state)" ] && return 0
+        TS_SOCKET="/var/run/tailscale/tailscaled.sock"
+        [ -n "$(ts_backend_state)" ] && return 0
+    done
+    TS_CLI=""
+    TS_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/tailscaled.sock"
+    return 1
+}
+
+install_tailscale_user() {
+    [ "$(uname -s)" = "Linux" ] || { log_info "Not Linux — remote (tailnet) pairing skipped, LAN only."; return 1; }
+    local arch tgz tmp dir
+    case "$(uname -m)" in
+        x86_64)  arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        armv7l|armv6l) arch=arm ;;
+        *) log_info "No tailscale static build for $(uname -m) — LAN pairing only."; return 1 ;;
+    esac
+    mkdir -p "$BIN_DIR"
+    if [ ! -x "$BIN_DIR/tailscaled" ] || [ ! -x "$BIN_DIR/tailscale" ]; then
+        tgz="tailscale_${TS_VERSION}_${arch}.tgz"
+        tmp="$(mktemp -d)"
+        log_info "Downloading tailscale $TS_VERSION ($arch) — one time…"
+        curl -fsSL "https://pkgs.tailscale.com/stable/$tgz" -o "$tmp/$tgz" \
+            || { log_warn "tailscale download failed — LAN pairing only."; rm -rf "$tmp"; return 1; }
+        tar -xzf "$tmp/$tgz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
+        dir="$tmp/tailscale_${TS_VERSION}_${arch}"
+        install -m755 "$dir/tailscale"  "$BIN_DIR/tailscale"
+        install -m755 "$dir/tailscaled" "$BIN_DIR/tailscaled"
+        rm -rf "$tmp"
+        log_success "Installed tailscale → $BIN_DIR"
+    fi
+    mkdir -p "$UNIT_DIR" "$TS_STATE_DIR"
+    cat > "$UNIT_DIR/tailscaled.service" <<EOF
+[Unit]
+Description=Moch tailscale daemon (userspace networking, no root)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$BIN_DIR/tailscaled --tun=userspace-networking --socket=$TS_SOCKET --statedir=$TS_STATE_DIR --socks5-server=localhost:$TS_SOCKS_PORT
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now tailscaled.service >/dev/null 2>&1 \
+        || { log_warn "tailscaled failed to start — LAN pairing only."; return 1; }
+    TS_CLI="$BIN_DIR/tailscale"
+    local i
+    for i in $(seq 1 10); do
+        [ -n "$(ts_backend_state)" ] && return 0
+        sleep 1
+    done
+    log_warn "tailscaled not responding — LAN pairing only."
+    return 1
+}
+
+# Set TS_HOST when a linked tailnet is available (no side effects).
+ts_pair_host() {
+    ts_find_daemon || return 1
+    [ "$(ts_backend_state)" = "Running" ] || return 1
+    TS_HOST="$(ts_dns_name)"
+    [ -n "$TS_HOST" ]
+}
+
+# Full wiring: daemon (install if missing) → login if needed → serve → TS_HOST.
+ensure_tailscale() {
+    [ "${MOCH_NO_TAILSCALE:-0}" = "1" ] && { log_info "Tailscale skipped (MOCH_NO_TAILSCALE=1)."; return 0; }
+    ts_find_daemon || install_tailscale_user || return 0
+    ts_find_daemon || return 0
+    if [ "$(ts_backend_state)" != "Running" ]; then
+        if [ -t 0 ] && (: </dev/tty) 2>/dev/null; then
+            log_info "One-time tailnet sign-in — open the URL printed below in any browser:"
+            ts_ctl up --timeout=180s \
+                || { log_warn "Login not finished — LAN pairing for now. Re-run \`moch\` to retry."; return 0; }
+        else
+            local url out
+            out="$(ts_ctl up --timeout=10s 2>&1 || true)"
+            url="$(printf '%s' "$out" | sed -n 's/.*\(https:\/\/login\.tailscale\.com[^ ]*\).*/\1/p' | head -1)"
+            log_info "Remote pairing needs a one-time tailscale sign-in:"
+            if [ -n "$url" ]; then
+                log_info "  1. open: $url"
+                log_info "  2. re-run: moch   (publishes the works-anywhere QR)"
+            else
+                log_info "  run \`moch\` in a terminal to sign in."
+            fi
+            return 0
+        fi
+    fi
+    if ts_ctl serve --bg "http://127.0.0.1:$MOCH_PROXY_PORT" >/dev/null 2>&1; then
+        log_success "tailscale serve active — pairing works from ANY network"
+    else
+        log_warn "tailscale serve failed — QR stays LAN-only."
+        return 0
+    fi
+    TS_HOST="$(ts_dns_name)"
+    [ -n "$TS_HOST" ] && log_success "Tailnet host: $TS_HOST"
 }
 
 ensure_token() {
@@ -223,23 +365,30 @@ start_services() {
 }
 
 print_qr() {
-    local host token py
-    host="$(lan_ip)"
+    local lan token py qr_host qr_tls
+    lan="$(lan_ip)"
     token="$(token_value)"
+    # Tailnet host (set by ensure_tailscale/ts_pair_host) pairs from ANY
+    # network; the LAN address only works on the same Wi-Fi.
+    if [ -n "$TS_HOST" ]; then
+        qr_host="$TS_HOST"; qr_tls=1
+    else
+        qr_host="$lan:$MOCH_PROXY_PORT"; qr_tls=0
+    fi
     echo -e "${BOLD}═══════════════════════ Moch is ready ═══════════════════════${NC}"
     echo
     # Vendored dependency-free generator (scripts/vendor/qrcodegen.py, MIT,
     # © Project Nayuki) — any python3 renders it; failure never hides the token.
     py="$(store_python || command -v python3 || true)"
     if [ -n "$py" ]; then
-        "$py" - "$SCRIPT_DIR/vendor" "$host" "$MOCH_PROXY_PORT" "$token" <<'PY' \
+        "$py" - "$SCRIPT_DIR/vendor" "$qr_host" "$qr_tls" "$token" <<'PY' \
             || log_warn "QR rendering failed — pair with the text values below"
 import sys
 sys.path.insert(0, sys.argv[1])
 from qrcodegen import QrCode
-payload = "hermes://connect?host=%s:%s&tls=0&token=%s" % tuple(sys.argv[2:5])
-qr = QrCode.encode_text(payload, QrCode.Ecc.MEDIUM)
-b, get = qr.get_size(), qr.get_module
+payload = "hermes://connect?host=%s&tls=%s&token=%s" % tuple(sys.argv[2:5])
+q = QrCode.encode_text(payload, QrCode.Ecc.MEDIUM)
+b, get = q.get_size(), q.get_module
 for y in range(-2, b + 2, 2):
     print("".join(
         "█" if (get(x, y) if 0 <= x < b and 0 <= y < b else False)
@@ -253,12 +402,23 @@ PY
         log_warn "No python found — printing text pairing only."
     fi
     echo " Scan this in the Moch app — or enter manually:"
-    echo -e "   Host:  ${BOLD}$host:$MOCH_PROXY_PORT${NC}"
-    echo -e "   Token: ${BOLD}$token${NC}"
-    echo -e "   Link:  ${BOLD}hermes://connect?host=$host:$MOCH_PROXY_PORT&tls=0&token=$token${NC}"
-    echo
-    echo " On your Tailnet? Use the machine's tailscale hostname instead, and"
-    echo " expose it securely:   tailscale serve --bg tcp:$MOCH_PROXY_PORT"
+    if [ -n "$TS_HOST" ]; then
+        echo " Works from ANY network (Wi-Fi, mobile data, away from home) —"
+        echo " needs the Tailscale app on the phone, connected to this tailnet:"
+        echo -e "   Host:  ${BOLD}wss://$TS_HOST${NC}"
+        echo -e "   Token: ${BOLD}$token${NC}"
+        echo -e "   Link:  ${BOLD}hermes://connect?host=$TS_HOST&tls=1&token=$token${NC}"
+        echo
+        echo " Same Wi-Fi only, no Tailscale app needed (fallback):"
+        echo -e "   Host:  ${BOLD}ws://$lan:$MOCH_PROXY_PORT${NC}"
+    else
+        echo -e "   Host:  ${BOLD}ws://$lan:$MOCH_PROXY_PORT${NC}  (same Wi-Fi only)"
+        echo -e "   Token: ${BOLD}$token${NC}"
+        echo -e "   Link:  ${BOLD}hermes://connect?host=$lan:$MOCH_PROXY_PORT&tls=0&token=$token${NC}"
+        echo
+        echo " Want pairing from ANY network (mobile data, away from home)?"
+        echo " Install the Tailscale app on the phone, then re-run:  moch"
+    fi
     echo
     echo " Next steps:"
     echo "   moch auth login    # add a model provider key (needed before chatting)"
@@ -297,6 +457,7 @@ cmd_setup() {
     if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         install_units
         start_services
+        ensure_tailscale
     else
         log_warn "systemd --user unavailable — skipping service install."
         log_warn "Run the backend manually:  HERMES_HOME=$MOCH_HOME $MOCH_CMD serve --host 127.0.0.1 --port $MOCH_PORT"
@@ -319,6 +480,11 @@ cmd_status() {
     done
     port_open "$MOCH_PORT" && log_success "loopback:$MOCH_PORT accepting" || { log_warn "loopback:$MOCH_PORT not accepting"; ok=0; }
     port_open "$MOCH_PROXY_PORT" && log_success "phone port :$MOCH_PROXY_PORT accepting" || { log_warn "phone port :$MOCH_PROXY_PORT not accepting"; ok=0; }
+    if ts_pair_host; then
+        log_success "tailnet pairing: wss://$TS_HOST (works from any network)"
+    else
+        log_info "tailnet pairing inactive — LAN only (install tailscale + re-run setup)"
+    fi
     [ "$ok" = 1 ] || exit 1
 }
 
@@ -326,6 +492,7 @@ cmd_restart() { require_install; systemctl --user restart moch-serve.service moc
 cmd_stop()    { systemctl --user stop moch-serve.service moch-proxy.service moch-cron.timer && log_success "stopped"; }
 
 cmd_uninstall() {
+    if ts_find_daemon; then ts_ctl serve off >/dev/null 2>&1 || true; fi
     systemctl --user disable --now moch-serve.service moch-proxy.service moch-cron.timer >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/moch-serve.service" "$UNIT_DIR/moch-proxy.service" \
           "$UNIT_DIR/moch-cron.service" "$UNIT_DIR/moch-cron.timer"
@@ -346,7 +513,7 @@ case "${1:-setup}" in
     status)    cmd_status ;;
     restart)   cmd_restart ;;
     stop)      cmd_stop ;;
-    qr)        require_install; ensure_token; print_qr ;;
+    qr)        require_install; ensure_token; ts_pair_host || true; print_qr ;;
     import-hermes) shift; exec bash "$SCRIPT_DIR/moch-import-hermes.sh" "$@" ;;
     uninstall) shift; cmd_uninstall "${1:-}" ;;
     *) echo "Usage: moch-serve.sh {setup|status|restart|stop|qr|import-hermes|uninstall [--purge]}"; exit 1 ;;
